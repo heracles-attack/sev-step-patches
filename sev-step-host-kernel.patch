@@ -1,0 +1,361 @@
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index da811d3ba38b..c3f3e89afb87 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -61,6 +61,9 @@
+ // SEV-STEP
+ #include <linux/sev-step/userspace_page_track_api.h>
+ 
++#define PWT_BIT (0x1ULL << 3)
++#define PCD_BIT (0x1ULL << 4)
++
+ extern bool itlb_multihit_kvm_mitigation;
+ 
+ int __read_mostly nx_huge_pages = -1;
+@@ -485,6 +488,8 @@ static u64 __get_spte_lockless(u64 *sptep)
+ static void mmu_spte_set(u64 *sptep, u64 new_spte)
+ {
+ 	WARN_ON(is_shadow_present_pte(*sptep));
++	new_spte |= (PCD_BIT | PWT_BIT);
++
+ 	__set_spte(sptep, new_spte);
+ }
+ 
+@@ -526,7 +531,9 @@ static u64 mmu_spte_update_no_track(u64 *sptep, u64 new_spte)
+ static bool mmu_spte_update(u64 *sptep, u64 new_spte)
+ {
+ 	bool flush = false;
+-	u64 old_spte = mmu_spte_update_no_track(sptep, new_spte);
++	u64 old_spte;
++	new_spte |= (PCD_BIT | PWT_BIT);
++	old_spte = mmu_spte_update_no_track(sptep, new_spte);
+ 
+ 	if (!is_shadow_present_pte(old_spte))
+ 		return false;
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 11d461349c63..6021543bd3d5 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1,5 +1,3 @@
+-#define pr_fmt(fmt) "SVM: " fmt
+-
+ #include <linux/kvm_host.h>
+ 
+ #include "irq.h"
+@@ -3972,11 +3970,217 @@ static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu)
+ 	guest_state_exit_irqoff();
+ }
+ 
++void __maybe_unused hexdump(char *data, size_t size)
++{
++	const unsigned char *byte = (const unsigned char *)data;
++	for (size_t i = 0; i < size; i += 16) {
++		printk(KERN_CONT "%08llx  ", (u64)byte + i); // Print offset
++
++		// Print hex values
++		for (size_t j = 0; j < 16; j++) {
++			if (i + j < size)
++				printk(KERN_CONT "%02x ", byte[i + j]);
++			else
++				printk(KERN_CONT "   ");
++		}
++
++		printk(" |");
++
++		// Print ASCII characters
++		for (size_t j = 0; j < 16; j++) {
++			if (i + j < size)
++				printk(KERN_CONT "%c", isprint(byte[i + j]) ?
++						     byte[i + j] :
++						     '.');
++			else
++				printk(KERN_CONT " ");
++		}
++
++		printk(KERN_CONT "|\n");
++	}
++}
++
++EXPORT_SYMBOL(hexdump);
++
++static inline unsigned long read_cr3(struct kvm_vcpu* vcpu) {
++    struct vcpu_svm *svm = to_svm(vcpu);  // Helper macro to get svm from vcpu
++    if (!svm || !svm->vmcb) {
++        pr_err("Invalid VCPU or VMCB\n");
++        return 0;
++    }
++    return svm->vmcb->control.nested_cr3;
++}
++
++static u64 map_physical_to_virtual(struct kvm_vcpu* vcpu, unsigned long virt_addr) {
++    unsigned long *pml4, *pdp, *pd, *pt;
++    unsigned long  index4, index3, index2, index1;
++    
++    // Get the base of PML5
++    index4 = (virt_addr >> 39) & 0x1FF;
++    index3 = (virt_addr >> 30) & 0x1FF;
++    index2 = (virt_addr >> 21) & 0x1FF;
++    index1 = (virt_addr >> 12) & 0x1FF;
++
++    pml4 = (unsigned long *)phys_to_virt(read_cr3(vcpu) & ~0xFFFull);
++    // pr_info("pml4 = %lx\n", (unsigned long)pml4);
++    if (!pml4[index4]) {
++        // pml4[index4] = virt_to_phys((void *)__get_free_page(GFP_KERNEL)) | PAGE_PRESENT | PAGE_RW;
++		pr_err("No entry present at lv4\n");
++		return 0;
++    }
++    // pr_info("pl4[index4] = %lx\n", pml4[index4]);
++    pdp = (unsigned long *)((unsigned long)phys_to_virt(pml4[index4]) & PAGE_MASK);
++    pr_info("pdp = %lx\n", (unsigned long)pdp);
++    if (!pdp[index3]) {
++        // pdp[index3] = virt_to_phys((void *)__get_free_page(GFP_KERNEL)) | PAGE_PRESENT | PAGE_RW;
++		pr_err("No entry present at lv3\n");
++		return 0;
++
++    }
++    // pr_info("pdp[index3] = %lx\n", pdp[index3]);
++    pd = (unsigned long *)((unsigned long)phys_to_virt(pdp[index3]) & PAGE_MASK);
++    pr_info("pd = %lx\n", (unsigned long)pd);
++    if (!pd[index2]) {
++        // pd[index2] = virt_to_phys((void *)__get_free_page(GFP_KERNEL)) | PAGE_PRESENT | PAGE_RW;
++		pr_err("No entry present at lv2\n");
++		return 0;
++
++    }
++    // pr_info("pd[index2] = %lx\n", pd[index2]);
++    pt = (unsigned long *)((unsigned long)phys_to_virt(pd[index2]) & PAGE_MASK);
++    pr_info("pt = %lx\n", (unsigned long)pt);
++    if (!pt[index1]) {
++        // pt[index1] = (phys_addr & PAGE_MASK) | PAGE_PRESENT | PAGE_RW;
++		pr_err("No entry present at lv1\n");
++		return 0;
++
++    }
++    // pr_info("pt[index1] = %lx\n", pt[index1]);
++	return pt[index1];
++
++    // Flush TLB
++    asm volatile("invlpg (%0)" ::"r"(virt_addr) : "memory");
++}
++
++#define PWT_BIT (0x1ULL << 3)
++#define PCD_BIT (0x1ULL << 4)
++
++static u64 set_uc(struct kvm_vcpu* vcpu, unsigned long virt_addr) {
++    unsigned long *pml4, *pdp, *pd, *pt;
++    unsigned long  index4, index3, index2, index1;
++    
++    index4 = (virt_addr >> 39) & 0x1FF;
++    index3 = (virt_addr >> 30) & 0x1FF;
++    index2 = (virt_addr >> 21) & 0x1FF;
++    index1 = (virt_addr >> 12) & 0x1FF;
++
++    pml4 = (unsigned long *)phys_to_virt(read_cr3(vcpu) & ~0xFFFull);
++    if (!pml4[index4]) {
++		pr_err("No entry present at lv4\n");
++		return 0;
++    }
++    pdp = (unsigned long *)((unsigned long)phys_to_virt(pml4[index4]) & PAGE_MASK);
++    pr_info("pdp = %lx\n", (unsigned long)pdp);
++    if (!pdp[index3]) {
++		pr_err("No entry present at lv3\n");
++		return 0;
++
++    }
++    pd = (unsigned long *)((unsigned long)phys_to_virt(pdp[index3]) & PAGE_MASK);
++    pr_info("pd = %lx\n", (unsigned long)pd);
++    if (!pd[index2]) {
++		pr_err("No entry present at lv2\n");
++		return 0;
++
++    }
++    pt = (unsigned long *)((unsigned long)phys_to_virt(pd[index2]) & PAGE_MASK);
++    pr_info("pt = %lx\n", (unsigned long)pt);
++    if (!pt[index1]) {
++		pr_err("No entry present at lv1\n");
++		return 0;
++
++    }
++	return pt[index1] |= (PWT_BIT | PCD_BIT) ;
++
++    asm volatile("invlpg (%0)" ::"r"(virt_addr) : "memory");
++}
++
++int __maybe_unused decrypt_page(struct kvm_vcpu *vcpu, u64 guest_gpa,
++				       void *out)
++{
++	struct kvm_sev_info *sev = &to_kvm_svm(vcpu->kvm)->sev_info;
++	void *page;
++	int error, ret = 0;
++	struct page *save_page;
++	u64 gpa = map_physical_to_virtual(vcpu, guest_gpa);
++	// u64 pfn = gfn_to_pfn(vcpu->kvm, guest_gpa >> PAGE_SHIFT);
++	u64 pfn = gpa>>PAGE_SHIFT;
++
++
++	// printk("gpa is supposed to be guest_gpa %llx\n", guest_gpa);
++	// printk("pfn according to gfn_to_pfn %llx\n", pfn);
++
++	save_page = alloc_page(GFP_KERNEL);
++	if (!save_page) {
++		return 1;
++	}
++
++	page = page_address(save_page);
++
++	ret = snp_guest_dbg_decrypt_page(__pa(sev->snp_context) >> PAGE_SHIFT,
++					 pfn, __pa(page) >> PAGE_SHIFT, &error);
++
++    // pr_info("debug decrypt error value 0x%x, ret is 0x%x\n", error, ret);
++
++	kvm_release_pfn_clean(pfn);
++	if (ret) {
++		pr_err("Unable to decrypt page\n");
++		return 1;
++	}
++
++	pr_info("Error is %d, ret is %d\n", error, ret);
++
++	memcpy((void *)out, page, 0x1000);
++
++	__free_page(virt_to_page(page));
++	return 0;
++}
++EXPORT_SYMBOL(decrypt_page);
++
++
++
++atomic_long_t a_addr = ATOMIC_LONG_INIT(0);
++EXPORT_SYMBOL(a_addr);
++
++static struct vmcb_save_area vmcb_sa;
++static struct sev_es_save_area *vmsa;
++
++struct kvm_vcpu * target_vcpu = NULL;
++EXPORT_SYMBOL(target_vcpu);
++
++atomic_t should_uc = ATOMIC_INIT(0);
++EXPORT_SYMBOL(should_uc);
++u64 *pages_to_uc = NULL;
++EXPORT_SYMBOL(pages_to_uc);
++size_t n_pages_to_uc = 0;
++EXPORT_SYMBOL(n_pages_to_uc);
++
++bool started = false;
++u64 last_rcx = 0;
++u64 total_steps = 0;
++u64 zero_steps = 0;
++u64 one_steps = 0;
++u64 n_steps = 0;
+ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+ {
++
++	u64 diff;
+ 	bool just_disblabled_stepping = false;
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 
++	if (!target_vcpu){
++		target_vcpu = vcpu;
++	}
+ 
+ 	//printk("svm_vcpu_run: irqs_disabled?: 0x%x",irqs_disabled());
+ 	trace_kvm_entry(vcpu);
+@@ -4141,6 +4345,11 @@ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+ 	if (!static_cpu_has(X86_FEATURE_V_SPEC_CTRL))
+ 		x86_spec_ctrl_set_guest(svm->spec_ctrl, svm->virt_spec_ctrl);
+ 
++	if (atomic_read(&should_uc)){
++		for (size_t i = 0; i < n_pages_to_uc; ++i){
++			set_uc(vcpu, pages_to_uc[i]);
++		}
++	}
+ 
+ 	svm_vcpu_enter_exit(vcpu);
+ 
+@@ -4313,6 +4522,67 @@ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+ 			as the ioctl api also uses this lock
+ 			*/
+ 			mutex_unlock(&sev_step_config_mutex); 
++
++			vmsa = kmalloc(max((u64)sizeof(struct sev_es_save_area),
++					   (u64)0x1000),
++				       GFP_KERNEL);
++			if (sev_step_get_vmcb_save_area(&svm->vcpu, &vmcb_sa,
++							vmsa)) {
++				printk("sev_step_get_vmcb_save_area failed\n");
++			}
++
++			// printk("DEBUG: RIP: %llx\n", vmsa->rip);
++			// printk("DEBUG: RAX: %llx\n", vmsa->rax);
++			// printk("DEBUG: RBX: %llx\n", vmsa->rbx);
++			// printk("DEBUG: RCX: %llx\n", vmsa->rcx);
++			// printk("DEBUG: RDX: %llx\n", vmsa->rdx);
++			// printk("DEBUG: RBP: %llx\n", vmsa->rbp);
++			// printk("DEBUG: RSP: %llx\n", vmsa->rsp);
++			// printk("DEBUG: RDI: %llx\n", vmsa->rdi);
++			// printk("DEBUG: RSI: %llx\n", vmsa->rsi);
++			// printk("---\n");
++			//
++			// if ((addr = atomic_long_read(&a_addr)) != 0) {
++			// 	if (decrypt_page(vcpu, addr, vmsa)) {
++			// 		printk("Unable to decrypt a page\n");
++			// 	} else {
++			// 		hexdump((char*)vmsa, 0x80);
++			// 	}
++			// }
++
++			if (started){
++				total_steps += 1;
++				if (total_steps % 0x1000){
++					printk("STEP_EXPR: at %llu stpes\n", total_steps);
++				}
++
++				diff = last_rcx - vmsa->rcx;
++
++				switch (diff) {
++					case 0:
++						zero_steps +=1;
++						break;
++					case 1:
++						one_steps +=1;
++						break;
++					default:
++					printk("STEP_EXPR: abnormal step size of 0x%llx\n", diff);
++					n_steps += 1;
++				}
++				
++				if (vmsa->rcx < 10){
++					printk("STEP_EXPR: ---\ntotal_steps 0x%llx\nzero_steps 0x%llx\none_steps 0x%llx\nn_steps 0x%llx\n", 
++							total_steps, zero_steps, one_steps, n_steps);
++				}
++
++				last_rcx = vmsa->rcx;
++
++			} else if (vmsa->rcx == 0x256000){
++				printk("STEP_EXPR: starting experiment\n");
++				started = true;
++				last_rcx = vmsa->rcx;
++			}
++
+ 			send_ret = usp_send_and_block(uspt_ctx, SEV_STEP_EVENT, (void *)&ss_event);
+ 			//sent sev step event
+ 			switch (send_ret)
+diff --git a/ubuntu.qcow2 b/ubuntu.qcow2
+new file mode 100644
+index 000000000000..968f8fcf72fa
+Binary files /dev/null and b/ubuntu.qcow2 differ
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index eb98b53fb424..34545ac7d49d 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -113,8 +113,10 @@ EXPORT_SYMBOL_GPL(halt_poll_ns_shrink);
+  */
+ 
+ DEFINE_MUTEX(kvm_lock);
++EXPORT_SYMBOL(kvm_lock);
+ static DEFINE_RAW_SPINLOCK(kvm_count_lock);
+ LIST_HEAD(vm_list);
++EXPORT_SYMBOL(vm_list);
+ 
+ static cpumask_var_t cpus_hardware_enabled;
+ static int kvm_usage_count;
